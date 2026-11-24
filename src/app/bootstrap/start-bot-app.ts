@@ -29,6 +29,7 @@ const LOG_FLUSH_TIMEOUT_MS = 1000;
 const TELEGRAM_STARTUP_RETRY_BASE_MS = 1000;
 const TELEGRAM_STARTUP_RETRY_CAP_MS = 60_000;
 const TELEGRAM_FATAL_TOKEN_CODES = new Set([401, 404]);
+const TELEGRAM_STARTUP_GETWEBHOOKINFO_MAX_ATTEMPTS = 3;
 
 function getTelegramErrorCode(error: unknown): number | null {
   if (typeof error !== "object" || error === null) {
@@ -118,6 +119,55 @@ async function callTelegramAtStartup<T>(
       }
 
       attempt += 1;
+      const delayMs = nextTelegramStartupRetryDelayMs(error, attempt);
+      logger.warn(
+        `[App] Telegram ${label} failed (attempt ${attempt}); retrying in ${delayMs}ms`,
+        error,
+      );
+      await wait(delayMs);
+    }
+  }
+}
+
+async function callTelegramAtStartupOrDefault<T>(
+  label: string,
+  operation: () => Promise<T>,
+  isShutdown: () => boolean,
+  defaultValue: T,
+  maxAttempts: number,
+): Promise<T | "shutdown"> {
+  let attempt = 0;
+
+  while (true) {
+    if (isShutdown()) {
+      return "shutdown";
+    }
+
+    try {
+      return await operation();
+    } catch (error) {
+      if (isShutdown()) {
+        return "shutdown";
+      }
+
+      if (isFatalTelegramTokenError(error)) {
+        logger.error("[App] Telegram rejected the bot token; not retrying", error);
+        throw error;
+      }
+
+      if (!isRetryableTelegramStartupError(error)) {
+        logger.error("[App] Telegram startup failed; not retrying", error);
+        throw error;
+      }
+
+      attempt += 1;
+      if (attempt >= maxAttempts) {
+        logger.warn(
+          `[App] ${label} rate-limited after ${attempt} attempt(s); assuming default and proceeding`,
+        );
+        return defaultValue;
+      }
+
       const delayMs = nextTelegramStartupRetryDelayMs(error, attempt);
       logger.warn(
         `[App] Telegram ${label} failed (attempt ${attempt}); retrying in ${delayMs}ms`,
@@ -270,10 +320,12 @@ export async function startBotApp(): Promise<void> {
   process.on("SIGTERM", handleSigterm);
 
   const isShutdown = (): boolean => shutdownStarted;
-  const webhookInfo = await callTelegramAtStartup(
+  const webhookInfo = await callTelegramAtStartupOrDefault(
     "getWebhookInfo",
     () => bot.api.getWebhookInfo(),
     isShutdown,
+    { url: "", has_custom_certificate: false, pending_update_count: 0 } as Awaited<ReturnType<typeof bot.api.getWebhookInfo>>,
+    TELEGRAM_STARTUP_GETWEBHOOKINFO_MAX_ATTEMPTS,
   );
   if (webhookInfo === "shutdown") {
     return;
